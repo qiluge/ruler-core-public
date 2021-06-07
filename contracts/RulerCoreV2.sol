@@ -48,8 +48,8 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
     mapping(address => Pair[]) private pairList;
     mapping(address => uint256) public override feesMap;
 
-    // v1.0.1
-    event FlashLoan(address _token, address _borrower, uint256 _amount);
+    // v1.0.2
+    uint256 public override depositPauseWindow;
 
     modifier onlyNotPaused() {
         require(!paused, "Ruler: paused");
@@ -62,6 +62,7 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
         rERC20Impl = _rERC20Impl;
         feeReceiver = _feeReceiver;
         flashLoanRate = 0.00085 ether;
+        depositPauseWindow = 24 hours;
         initializeOwner();
         initializeReentrancyGuard();
     }
@@ -270,8 +271,12 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
         require(_feeRate < 0.1 ether, "Ruler: fee rate must be < 10%");
         require(_expiry > block.timestamp, "Ruler: expiry in the past");
         require(minColRatioMap[_col] > 0, "Ruler: col not listed");
-        minColRatioMap[_paired] = 1e18;
-        // default paired token to 100% collateralization ratio as most of them are stablecoins, can be updated later.
+        if (minColRatioMap[_paired] == 0) {
+            collaterals.push(_paired);
+            // auto add paired token to collateral list
+            minColRatioMap[_paired] = 1.05 ether;
+            // default paired token to 105% collateralization ratio as most of them are stablecoins, can be updated later.
+        }
 
         Pair memory pair = Pair({
         active : true,
@@ -292,13 +297,14 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
      * @notice allow flash loan borrow allowed tokens up to all core contracts' holdings
      * _receiver will received the requested amount, and need to payback the loan amount + fees
      * _receiver must implement IERC3156FlashBorrower
+     * no deflationary tokens
      */
     function flashLoan(
         IERC3156FlashBorrower _receiver,
         address _token,
         uint256 _amount,
         bytes calldata _data
-    ) public override onlyNotPaused nonReentrant returns (bool) {
+    ) public override onlyNotPaused returns (bool) {
         require(minColRatioMap[_token] > 0, "Ruler: token not allowed");
         IERC20 token = IERC20(_token);
         uint256 tokenBalBefore = token.balanceOf(address(this));
@@ -311,9 +317,8 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
 
         // receive loans and fees
         token.safeTransferFrom(address(_receiver), address(this), _amount + fees);
-        uint256 receivedFees = token.balanceOf(address(this)) - tokenBalBefore;
-        require(receivedFees >= fees, "Ruler: not enough fees");
-        feesMap[_token] = feesMap[_token] + receivedFees;
+        require(token.balanceOf(address(this)) - tokenBalBefore >= fees, "Ruler: not enough fees");
+        feesMap[_token] = feesMap[_token] + fees;
         emit FlashLoan(_token, address(_receiver), _amount);
         return true;
     }
@@ -328,7 +333,7 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
     function updateCollateral(address _col, uint256 _minColRatio) external override onlyOwner {
         require(_minColRatio > 0, "Ruler: min colRatio < 0");
         emit CollateralUpdated(_col, minColRatioMap[_col], _minColRatio);
-        if (minColRatioMap[_col] == 0) {
+        if (minColRatioMap[_col] == 0 || !_colInList(_col, collaterals)) {
             collaterals.push(_col);
         }
         minColRatioMap[_col] = _minColRatio;
@@ -373,6 +378,12 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
         require(_address != address(0), "Ruler: address cannot be 0");
         emit AddressUpdated('oracle', address(oracle), _address);
         oracle = IOracle(_address);
+    }
+
+    /// @notice flashloan rate can be anything
+    function setDepositPauseWindow(uint256 _newWindow) external override onlyOwner {
+        emit DepositPauseWindow(depositPauseWindow, _newWindow);
+        depositPauseWindow = _newWindow;
     }
 
     function getCollaterals() external view override returns (address[] memory) {
@@ -428,7 +439,7 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
 
     /// @notice version of current Ruler Core hardcoded
     function version() external pure override returns (string memory) {
-        return '1.0.1';
+        return '1.0.2';
     }
 
     function _safeTransfer(IERC20 _token, address _account, uint256 _amount) private {
@@ -502,7 +513,7 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
     function _validateDepositInputs(address _col, Pair memory _pair) private view {
         require(_pair.mintRatio != 0, "Ruler: pair does not exist");
         require(_pair.active, "Ruler: pair inactive");
-        require(_pair.expiry > block.timestamp, "Ruler: pair expired");
+        require(_pair.expiry - depositPauseWindow > block.timestamp, "Ruler: deposit ended");
 
         // Oracle price is not required, the consequence is low since it will just allow users to deposit collateral (which can be collected thro repay before expiry. If default, early repayments will be diluted
         if (address(oracle) != address(0)) {
@@ -515,5 +526,13 @@ contract RulerCore is Ownable, IRulerCore, IERC3156FlashLender, ReentrancyGuard 
                 }
             }
         }
+    }
+
+    // should never be called except to re-add paired tokens already in contract
+    function _colInList(address _col, address[] memory _cols) private pure returns (bool) {
+        for (uint256 i = 0; i < _cols.length; i++) {
+            if (_col == _cols[i]) return true;
+        }
+        return false;
     }
 }
